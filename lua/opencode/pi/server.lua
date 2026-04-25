@@ -2,7 +2,11 @@ local Promise = require('opencode.promise')
 local log = require('opencode.log')
 
 ---@class PiServer
----@field job vim.SystemObj|nil
+---@field handle uv_process_t|nil
+---@field stdin uv_pipe_t|nil
+---@field stdout uv_pipe_t|nil
+---@field stderr uv_pipe_t|nil
+---@field pid integer|nil
 ---@field is_ready boolean
 ---@field pending_commands table<string, Promise>
 ---@field event_callbacks fun(event:table)[]
@@ -14,7 +18,11 @@ PiServer.__index = PiServer
 
 function PiServer.new()
   return setmetatable({
-    job = nil,
+    handle = nil,
+    stdin = nil,
+    stdout = nil,
+    stderr = nil,
+    pid = nil,
     is_ready = false,
     pending_commands = {},
     event_callbacks = {},
@@ -29,7 +37,6 @@ end
 ---@return Promise<PiServer>
 function PiServer:spawn(cmd, opts)
   opts = opts or {}
-  local config = require('opencode.config')
 
   log.debug('pi server: spawning with cmd: %s', vim.inspect(cmd))
 
@@ -47,48 +54,71 @@ function PiServer:spawn(cmd, opts)
     end
   end
 
-  self.job = vim.system(cmd, {
+  local stdin = vim.uv.new_pipe(false)
+  local stdout = vim.uv.new_pipe(false)
+  local stderr = vim.uv.new_pipe(false)
+
+  if not stdin or not stdout or not stderr then
+    fail_startup('Failed to create pipes for pi process')
+    return self.spawn_promise
+  end
+
+  self.stdin = stdin
+  self.stdout = stdout
+  self.stderr = stderr
+
+  local spawn_opts = {
+    stdio = { stdin, stdout, stderr },
+    args = vim.list_slice(cmd, 2),
     cwd = opts.cwd,
-    stdin = true,
-    stdout = function(err, data)
-      if err then
-        fail_startup(tostring(err))
-        return
-      end
-      if data then
-        self:_on_stdout(data)
-      end
-    end,
-    stderr = function(err, data)
-      if err then
-        fail_startup(tostring(err))
-        return
-      end
-      if data and data ~= '' then
-        table.insert(startup_stderr, data)
-        log.debug('pi server stderr: %s', data)
-      end
-    end,
-  }, function(obj)
+  }
+
+  local handle, pid = vim.uv.spawn(cmd[1], spawn_opts, function(code, signal)
     if not self.is_ready and not startup_failed then
       local stderr_output = table.concat(startup_stderr, '')
       local msg = stderr_output ~= '' and stderr_output
-        or string.format('pi process exited unexpectedly (code=%s, signal=%s)', tostring(obj.code), tostring(obj.signal))
+        or string.format('pi process exited unexpectedly (code=%s, signal=%s)', tostring(code), tostring(signal))
       fail_startup(msg)
     end
-    self:_on_exit(obj.code, obj.signal)
+    self:_on_exit(code, signal)
     if opts.on_exit then
-      opts.on_exit(obj.code or 0, obj.signal or 0)
+      opts.on_exit(code or 0, signal or 0)
     end
     self.shutdown_promise:resolve(true)
   end)
 
-  if not self.job or not self.job.pid then
+  if not handle then
     fail_startup('Failed to spawn pi process')
     return self.spawn_promise
   end
 
-  -- pi --mode rpc is ready immediately (no startup message needed)
+  self.handle = handle
+  self.pid = pid
+
+  -- Start reading stdout
+  stdout:read_start(function(err, data)
+    if err then
+      log.error('pi server stdout error: %s', tostring(err))
+      return
+    end
+    if data then
+      self:_on_stdout(data)
+    end
+  end)
+
+  -- Start reading stderr
+  stderr:read_start(function(err, data)
+    if err then
+      log.error('pi server stderr error: %s', tostring(err))
+      return
+    end
+    if data and data ~= '' then
+      table.insert(startup_stderr, data)
+      log.debug('pi server stderr: %s', data)
+    end
+  end)
+
+  -- pi --mode rpc is ready immediately
   vim.defer_fn(function()
     if not self.is_ready and not startup_failed then
       self.is_ready = true
@@ -103,7 +133,7 @@ function PiServer:spawn(cmd, opts)
 end
 
 function PiServer:is_running()
-  return self.job ~= nil and self.job.pid ~= nil
+  return self.handle ~= nil and not self.handle:is_closing()
 end
 
 ---@param command table
@@ -111,7 +141,7 @@ end
 function PiServer:send_command(command)
   local promise = Promise.new()
 
-  if not self.job or not self.job.pid then
+  if not self.stdin or self.stdin:is_closing() then
     promise:reject('Pi server is not running')
     return promise
   end
@@ -122,14 +152,12 @@ function PiServer:send_command(command)
   self.pending_commands[id] = promise
 
   local jsonl = vim.json.encode(command) .. '\n'
-  local ok, err = pcall(function()
-    self.job:write(jsonl)
+  self.stdin:write(jsonl, function(err)
+    if err then
+      self.pending_commands[id] = nil
+      promise:reject('Failed to write to pi stdin: ' .. tostring(err))
+    end
   end)
-
-  if not ok then
-    self.pending_commands[id] = nil
-    promise:reject('Failed to write to pi stdin: ' .. tostring(err))
-  end
 
   return promise
 end
@@ -153,25 +181,36 @@ function PiServer:shutdown()
     return self.shutdown_promise
   end
 
-  if self.job and self.job.pid then
-    local ok = pcall(function()
-      vim.uv.kill(self.job.pid, 15)
-    end)
-    if not ok then
+  if self.handle and not self.handle:is_closing() then
+    if self.pid then
       pcall(function()
-        vim.uv.kill(self.job.pid, 9)
+        vim.uv.kill(self.pid, 15)
       end)
     end
+    self.handle:close()
   end
 
-  -- Reject any pending commands
+  if self.stdin and not self.stdin:is_closing() then
+    self.stdin:close()
+  end
+  if self.stdout and not self.stdout:is_closing() then
+    self.stdout:close()
+  end
+  if self.stderr and not self.stderr:is_closing() then
+    self.stderr:close()
+  end
+
   for id, promise in pairs(self.pending_commands) do
     promise:reject('Server shut down')
     self.pending_commands[id] = nil
   end
 
   self.is_ready = false
-  self.job = nil
+  self.handle = nil
+  self.stdin = nil
+  self.stdout = nil
+  self.stderr = nil
+  self.pid = nil
 
   if not self.shutdown_promise:is_resolved() then
     self.shutdown_promise:resolve(true)
@@ -201,7 +240,6 @@ function PiServer:_on_stdout(data)
     local line = self.buffer:sub(1, newline_pos - 1)
     self.buffer = self.buffer:sub(newline_pos + 1)
 
-    -- Strip trailing \r for Windows compatibility
     if line:sub(-1) == '\r' then
       line = line:sub(1, -2)
     end
@@ -233,7 +271,6 @@ function PiServer:_process_line(line)
       end
     end
   else
-    -- It's an event
     for _, cb in ipairs(self.event_callbacks) do
       local ok2, err = pcall(cb, obj)
       if not ok2 then
