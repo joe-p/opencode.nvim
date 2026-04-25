@@ -38,7 +38,7 @@ end
 function PiServer:spawn(cmd, opts)
   opts = opts or {}
 
-  log.debug('pi server: spawning with cmd: %s', vim.inspect(cmd))
+  log.info('pi server: spawning with cmd: %s', vim.inspect(cmd))
 
   local startup_stderr = {}
   local startup_failed = false
@@ -102,6 +102,7 @@ function PiServer:spawn(cmd, opts)
       return
     end
     if data then
+      log.debug('pi server stdout raw: %q', data)
       self:_on_stdout(data)
     end
   end)
@@ -114,7 +115,7 @@ function PiServer:spawn(cmd, opts)
     end
     if data and data ~= '' then
       table.insert(startup_stderr, data)
-      log.debug('pi server stderr: %s', data)
+      log.info('pi server stderr: %s', vim.trim(data))
     end
   end)
 
@@ -152,8 +153,10 @@ function PiServer:send_command(command)
   self.pending_commands[id] = promise
 
   local jsonl = vim.json.encode(command) .. '\n'
+  log.debug('pi server stdin -> %s', vim.trim(jsonl))
   self.stdin:write(jsonl, function(err)
     if err then
+      log.error('pi server stdin write error: %s', tostring(err))
       self.pending_commands[id] = nil
       promise:reject('Failed to write to pi stdin: ' .. tostring(err))
     end
@@ -254,6 +257,8 @@ function PiServer:_process_line(line)
     return
   end
 
+  log.debug('pi server stdout <- %s', line)
+
   local ok, obj = pcall(vim.json.decode, line)
   if not ok or type(obj) ~= 'table' then
     log.warn('pi server: failed to parse JSONL line: %s', line)
@@ -264,13 +269,17 @@ function PiServer:_process_line(line)
     local promise = self.pending_commands[obj.id]
     if promise then
       self.pending_commands[obj.id] = nil
+      log.debug('pi server: resolving command %s (success=%s)', obj.id, tostring(obj.success))
       if obj.success == false then
         promise:reject(obj.error or 'Command failed')
       else
         promise:resolve(obj.data or obj)
       end
+    else
+      log.debug('pi server: unmatched response id=%s', obj.id)
     end
   else
+    log.debug('pi server: forwarding event type=%s', obj.type or '?')
     for _, cb in ipairs(self.event_callbacks) do
       local ok2, err = pcall(cb, obj)
       if not ok2 then

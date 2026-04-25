@@ -7,6 +7,8 @@ local log = require('opencode.log')
 ---@field session_name string|nil
 ---@field session_file string|nil
 ---@field _event_callback function|nil
+---@field _event_emitter function|nil
+---@field _pending_events table[]
 local PiApiClient = {}
 PiApiClient.__index = PiApiClient
 
@@ -17,7 +19,35 @@ function PiApiClient.new(server)
     session_name = nil,
     session_file = nil,
     _event_callback = nil,
+    _event_emitter = nil,
+    _pending_events = {},
   }, PiApiClient)
+end
+
+function PiApiClient:_emit_event(event_name, data)
+  local event = { type = event_name, properties = data }
+  if self._event_emitter then
+    local ok, err = pcall(self._event_emitter, event)
+    if not ok then
+      log.error('pi api_client: failed to emit event %s: %s', event_name, tostring(err))
+    end
+  else
+    table.insert(self._pending_events, event)
+    log.debug('pi api_client: queued event %s (emitter not ready yet)', event_name)
+  end
+end
+
+function PiApiClient:_flush_pending_events()
+  if not self._event_emitter then
+    return
+  end
+  while #self._pending_events > 0 do
+    local event = table.remove(self._pending_events, 1)
+    local ok, err = pcall(self._event_emitter, event)
+    if not ok then
+      log.error('pi api_client: failed to emit queued event %s: %s', event.type, tostring(err))
+    end
+  end
 end
 
 function PiApiClient:_ensure_event_callback()
@@ -33,25 +63,6 @@ function PiApiClient:_ensure_event_callback()
   end
 
   return self._event_callback
-end
-
----@param event_manager EventManager
-function PiApiClient:subscribe_to_events(event_manager)
-  if not self.server then
-    return
-  end
-
-  self:unsubscribe_from_events()
-
-  local adapter = require('opencode.pi.event_adapter').new()
-  adapter:set_event_manager(event_manager)
-  adapter:set_session_id(self.session_id or 'pi-session')
-
-  self._event_callback = function(event)
-    adapter:handle_event(event)
-  end
-
-  self.server:on_event(self._event_callback)
 end
 
 function PiApiClient:unsubscribe_from_events()
@@ -361,8 +372,11 @@ function PiApiClient:create_message(id, message_data, directory)
       cmd.images = prompt_data.images
     end
 
+    log.debug('pi api_client: sending prompt (len=%d)', #prompt_data.message)
     return self.server:send_command(cmd)
   end):and_then(function(response)
+    log.debug('pi api_client: prompt accepted, synthesizing user message')
+
     -- The prompt command response just indicates acceptance.
     -- We synthesize a user message immediately so it appears in the UI.
     local session_id = self.session_id or id or 'pi-session'
@@ -406,7 +420,16 @@ function PiApiClient:create_message(id, message_data, directory)
       })
     end
 
+    -- Emit events so the renderer shows the user message immediately
+    self:_emit_event('message.updated', { info = user_message.info })
+    for _, part in ipairs(user_message.parts) do
+      self:_emit_event('message.part.updated', { part = part })
+    end
+
     return { info = user_message.info, parts = user_message.parts }
+  end):catch(function(err)
+    log.error('pi api_client: create_message failed: %s', vim.inspect(err))
+    return Promise.new():reject(err)
   end)
 end
 
@@ -641,6 +664,8 @@ function PiApiClient:subscribe_to_events(directory, on_event)
   end
 
   self:unsubscribe_from_events()
+  self._event_emitter = on_event
+  self:_flush_pending_events()
 
   local adapter = require('opencode.pi.event_adapter').new()
   adapter:set_session_id(self.session_id or 'pi-session')
@@ -658,6 +683,7 @@ function PiApiClient:subscribe_to_events(directory, on_event)
   end
 
   self.server:on_event(self._event_callback)
+  log.debug('pi api_client: subscribed to pi events')
 
   -- Return a handle that unsubscribes when shutdown
   local client = self
