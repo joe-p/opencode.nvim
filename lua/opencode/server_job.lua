@@ -185,9 +185,67 @@ local function resolve_port()
   return existing or math.random(1024, 65535)
 end
 
+--- Ensure the pi RPC server is running, starting it if necessary.
+--- @return Promise<PiServer>
+function M.ensure_pi_server()
+  local promise = Promise.new()
+
+  if state.opencode_server and state.opencode_server:is_running() then
+    return promise:resolve(state.opencode_server)
+  end
+
+  local PiServer = require('opencode.pi.server')
+  local pi_server = PiServer.new()
+  state.jobs.set_server(pi_server)
+
+  local cmd = vim.list_extend({ config.pi.executable, '--mode', 'rpc' }, config.pi.args or {})
+
+  -- Ensure pi server is shut down on nvim exit
+  local pi_vim_leave_setup = false
+  if not pi_vim_leave_setup then
+    pi_vim_leave_setup = true
+    vim.api.nvim_create_autocmd('VimLeavePre', {
+      group = vim.api.nvim_create_augroup('OpencodePiVimLeavePre', { clear = true }),
+      callback = function()
+        if state.opencode_server and state.opencode_server.shutdown then
+          state.opencode_server:shutdown()
+        end
+      end,
+    })
+  end
+
+  pi_server:spawn(cmd, {
+    on_ready = function(server)
+      log.notify('Started pi RPC server', vim.log.levels.INFO)
+      -- Create and attach the API client
+      local PiApiClient = require('opencode.pi.api_client')
+      local api_client = PiApiClient.new(server)
+      state.jobs.set_api_client(api_client)
+      -- Event subscription is handled by EventManager:_subscribe_to_server_events
+      -- when the opencode_server state change is detected
+      promise:resolve(server)
+    end,
+    on_error = function(err)
+      log.notify('Failed to start pi server: ' .. vim.inspect(err), vim.log.levels.ERROR)
+      promise:reject(err)
+    end,
+    on_exit = function(code, signal)
+      if not promise:is_resolved() then
+        promise:reject(string.format('pi process exited (code=%s, signal=%s)', tostring(code), tostring(signal)))
+      end
+    end,
+  })
+
+  return promise
+end
+
 --- Ensure the opencode server is running, starting it if necessary.
---- @return Promise<OpencodeServer>
+--- @return Promise<OpencodeServer|PiServer>
 function M.ensure_server()
+  if config.pi and config.pi.enabled then
+    return M.ensure_pi_server()
+  end
+
   local promise = Promise.new()
 
   if state.opencode_server and state.opencode_server:is_running() then

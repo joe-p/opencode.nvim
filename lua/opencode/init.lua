@@ -47,11 +47,22 @@ function M.setup(opts)
   state.store.subscribe('pending_permissions', session_runtime._on_current_permission_change)
   state.store.subscribe('current_model', on_current_model_change)
 
-  vim.schedule(function()
-    session_runtime.opencode_ok()
-  end)
-  local OpencodeApiClient = require('opencode.api_client')
-  state.jobs.set_api_client(OpencodeApiClient.create())
+  if config.pi and config.pi.enabled then
+    vim.schedule(function()
+      local pi_ok = require('opencode.services.session_runtime').pi_ok()
+      if not pi_ok then
+        vim.notify('pi command not found - please install pi before using pi mode', vim.log.levels.ERROR)
+      end
+    end)
+    local PiApiClient = require('opencode.pi.api_client')
+    state.jobs.set_api_client(PiApiClient.new(nil))
+  else
+    vim.schedule(function()
+      session_runtime.opencode_ok()
+    end)
+    local OpencodeApiClient = require('opencode.api_client')
+    state.jobs.set_api_client(OpencodeApiClient.create())
+  end
 
   require('opencode.commands').setup()
   require('opencode.ui.completion').setup()

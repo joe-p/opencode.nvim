@@ -51,7 +51,17 @@ M.send_message = Promise.async(function(prompt, opts)
     state.model.set_mode(opts.agent)
   end
 
-  params.parts = context.format_message(prompt, opts.context):await()
+  if config.pi and config.pi.enabled then
+    local pi_context = require('opencode.pi.context_formatter').format_parts_for_pi(prompt, context.format_message(prompt, opts.context):await())
+    params.parts = { { type = 'text', text = pi_context.message } }
+    if pi_context.images and #pi_context.images > 0 then
+      for _, img in ipairs(pi_context.images) do
+        table.insert(params.parts, { type = 'file', filename = img.mimeType or 'image', mime = img.mimeType })
+      end
+    end
+  else
+    params.parts = context.format_message(prompt, opts.context):await()
+  end
   params.system = opts.system or config.default_system_prompt or nil
 
   local session_id = state.active_session.id

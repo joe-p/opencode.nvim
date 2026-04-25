@@ -283,6 +283,12 @@ M.defaults = {
     default_agent = nil,
     instructions = nil, -- Use instructions prompt by default
   },
+  pi = {
+    enabled = false,
+    executable = 'pi',
+    args = {},
+    session_dir = nil,
+  },
 }
 
 M.values = vim.deepcopy(M.defaults)

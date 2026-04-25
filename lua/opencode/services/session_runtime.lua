@@ -135,11 +135,15 @@ M.open = Promise.async(function(opts)
     if opts.new_session then
       state.session.clear_active()
       context.unload_attachments()
-      agent_model.ensure_current_mode():await()
+      if not (config.pi and config.pi.enabled) then
+        agent_model.ensure_current_mode():await()
+      end
       state.session.set_active(M.create_new_session():await())
       log.debug('Created new session on open', { session = state.active_session.id })
     else
-      agent_model.ensure_current_mode():await()
+      if not (config.pi and config.pi.enabled) then
+        agent_model.ensure_current_mode():await()
+      end
       if not state.active_session then
         state.session.set_active(session.get_last_workspace_session():await())
         if not state.active_session then
@@ -181,6 +185,10 @@ M.create_new_session = Promise.async(function(title_or_opts)
     :await()
 
   if session_response and session_response.id then
+    if config.pi and config.pi.enabled then
+      -- Pi mode: session_response is already a Session-like object
+      return session_response
+    end
     local new_session = session.get_by_id(session_response.id):await()
     return new_session
   end
@@ -215,14 +223,14 @@ M.cancel = Promise.async(function()
     end
 
     if vim.g.opencode_abort_count >= 3 then
-      vim.notify('Re-starting Opencode server', vim.log.levels.WARN)
+      vim.notify('Re-starting server', vim.log.levels.WARN)
       vim.g.opencode_abort_count = 0
       if state.opencode_server then
         state.opencode_server:shutdown():await()
       end
 
       state.jobs.clear_server()
-      state.jobs.set_server(server_job.ensure_server():await() --[[@as OpencodeServer]])
+      state.jobs.set_server(server_job.ensure_server():await() --[[@as OpencodeServer|PiServer]])
     end
   end
 
@@ -233,6 +241,10 @@ M.cancel = Promise.async(function()
     ui.focus_input()
   end
 end)
+
+M.pi_ok = function()
+  return vim.fn.executable(config.pi.executable) == 1
+end
 
 M.opencode_ok = Promise.async(function()
   if vim.fn.executable(config.opencode_executable) == 0 then
