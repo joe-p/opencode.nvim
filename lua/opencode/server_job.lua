@@ -20,6 +20,7 @@ end
 --- @param timeout number
 --- @return Promise<string|nil>
 local function try_custom_server(base_url, timeout)
+  vim.notify('IN CUSTOM SERVER')
   local promise = Promise.new()
   local health_url = base_url .. '/global/health'
 
