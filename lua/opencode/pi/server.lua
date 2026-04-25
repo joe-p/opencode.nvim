@@ -279,11 +279,14 @@ function PiServer:_process_line(line)
       log.debug('pi server: unmatched response id=%s', obj.id)
     end
   else
-    log.debug('pi server: forwarding event type=%s', obj.type or '?')
+    log.info('pi server: event <- type=%s', obj.type or '?')
     for _, cb in ipairs(self.event_callbacks) do
       local ok2, err = pcall(cb, obj)
       if not ok2 then
         log.error('pi server: event callback error: %s', tostring(err))
+        vim.schedule(function()
+          vim.notify(string.format('[pi] Event callback error: %s', tostring(err)), vim.log.levels.ERROR)
+        end)
       end
     end
   end

@@ -37,6 +37,7 @@ function PiEventAdapter:_emit(event_name, data)
   if not self.event_manager then
     return
   end
+  log.info('pi event adapter: emitting %s', event_name)
   self.event_manager:emit(event_name, data)
 end
 
@@ -48,9 +49,13 @@ function PiEventAdapter:handle_event(event)
 
   local handler = self['_' .. event.type]
   if handler then
+    log.info('pi event adapter: handling %s', event.type)
     local ok, err = pcall(handler, self, event)
     if not ok then
       log.error('pi event adapter: error handling %s: %s', event.type, tostring(err))
+      vim.schedule(function()
+        vim.notify(string.format('[pi] Event handler error (%s): %s', event.type, tostring(err)), vim.log.levels.ERROR)
+      end)
     end
   else
     log.debug('pi event adapter: unhandled event type: %s', event.type)
@@ -62,6 +67,9 @@ end
 -- ============================================================================
 
 function PiEventAdapter:_agent_start(event)
+  vim.schedule(function()
+    vim.notify('[pi] Agent started', vim.log.levels.INFO)
+  end)
   self:_emit('session.status', {
     sessionID = self.session_id or '',
     status = { type = 'running' },
@@ -69,6 +77,9 @@ function PiEventAdapter:_agent_start(event)
 end
 
 function PiEventAdapter:_agent_end(event)
+  vim.schedule(function()
+    vim.notify('[pi] Agent completed', vim.log.levels.INFO)
+  end)
   -- Finalize any pending assistant message
   if self.current_message_id then
     self:_finalize_current_message()
@@ -148,6 +159,30 @@ function PiEventAdapter:_message_update(event)
   end
 
   local session_id = self.session_id or 'pi-session'
+
+  -- Prefer the message id from event.message if available
+  if event.message then
+    local mid = self:_ensure_message_id(event.message, session_id)
+    if mid ~= self.current_message_id then
+      self.current_message_id = mid
+      self.current_assistant_parts = {}
+      -- Emit message header if we haven't seen it yet
+      self:_emit('message.updated', {
+        info = {
+          id = mid,
+          sessionID = session_id,
+          role = 'assistant',
+          time = { created = event.message.timestamp or (os.time() * 1000), completed = 0 },
+          tokens = { input = 0, output = 0, cache = { read = 0, write = 0 } },
+          cost = 0,
+          path = { cwd = vim.fn.getcwd(), root = vim.fn.getcwd() },
+          modelID = event.message.model or '',
+          providerID = event.message.provider or '',
+        },
+      })
+    end
+  end
+
   local message_id = self.current_message_id or (session_id .. '-current')
 
   if ame.type == 'start' then
